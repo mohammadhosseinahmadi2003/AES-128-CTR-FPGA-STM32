@@ -1,0 +1,123 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.aes_pkg.all;
+
+entity aes_key_expand_128 is
+  port(
+    clk   : in  std_logic;
+    rst   : in  std_logic;
+    start : in  std_logic;
+    key   : in  std_logic_vector(127 downto 0);
+    rk    : out rk_array_t;
+    done  : out std_logic
+  );
+end entity;
+
+architecture rtl of aes_key_expand_128 is
+  -- FSM states for sequential round-key generation
+  type st_t is (IDLE, ADDR, WAITS, COMB);
+  signal state : st_t := IDLE;
+
+  -- Internal storage for all round keys
+  signal rk_r   : rk_array_t;
+  -- Current round index (1 to 10 for AES-128 expansion)
+  signal rcur   : integer range 0 to 10 := 0;
+  -- Rotated version of the last 32-bit word from the previous round key
+  signal rotw   : std_logic_vector(31 downto 0);
+
+  -- Output word from the four parallel S-Boxes (SubWord result)
+  signal sb_din  : std_logic_vector(31 downto 0);
+begin
+
+  -- Instantiate four S-Boxes in parallel to perform SubWord on rotw
+  gen_sb : for i in 0 to 3 generate
+    u_sb : entity work.aes_sbox_bram
+      port map(
+        clk  => clk,
+        addr => rotw(31-8*i downto 24-8*i),
+        dout => sb_din(31-8*i downto 24-8*i)
+      );
+  end generate;
+
+  -- Drive the output round-key array from the internal register
+  rk <= rk_r;
+
+  process(clk)
+    variable prev : std_logic_vector(127 downto 0);
+    variable temp : std_logic_vector(31 downto 0);
+    variable w0,w1,w2,w3 : std_logic_vector(31 downto 0);
+    variable lastw : std_logic_vector(31 downto 0);
+  begin
+    if rising_edge(clk) then
+      if rst = '1' then
+        -- Reset FSM and control outputs
+        state <= IDLE;
+        done  <= '0';
+        rcur  <= 0;
+      else
+        -- Default: done is a one-cycle pulse asserted only at completion
+        done <= '0';
+
+        case state is
+
+          when IDLE =>
+            if start = '1' then
+              -- Store the original cipher key as round key 0
+              rk_r(0) <= key;
+              -- Start generating round key 1
+              rcur    <= 1;
+
+              -- Take the last word of the input key and apply RotWord
+              lastw   := key(31 downto 0);
+              rotw    <= lastw(23 downto 0) & lastw(31 downto 24);
+
+              -- Wait for synchronous S-Box output
+              state   <= WAITS;
+            end if;
+
+          when ADDR =>
+            -- Prepare RotWord of the last word from the previous round key
+            prev  := rk_r(rcur-1);
+            lastw := prev(31 downto 0);
+            rotw  <= lastw(23 downto 0) & lastw(31 downto 24);
+
+            -- Wait for synchronous S-Box output
+            state <= WAITS;
+
+          when WAITS =>
+            -- One extra cycle is needed because the S-Box is synchronous
+            state <= COMB;
+
+          when COMB =>
+            -- Read the previous round key
+            prev := rk_r(rcur-1);
+
+            -- Apply SubWord output and XOR with the round constant
+            temp := sb_din xor (RCON(rcur) & x"000000");
+
+            -- Generate the next four 32-bit words of the round key
+            w0   := prev(127 downto 96) xor temp;
+            w1   := prev(95  downto 64) xor w0;
+            w2   := prev(63  downto 32) xor w1;
+            w3   := prev(31  downto  0) xor w2;
+
+            -- Store the newly generated round key
+            rk_r(rcur) <= w0 & w1 & w2 & w3;
+
+            if rcur = 10 then
+              -- All 11 round keys are ready
+              done  <= '1';
+              state <= IDLE;
+            else
+              -- Continue with the next round key
+              rcur  <= rcur + 1;
+              state <= ADDR;
+            end if;
+
+        end case;
+      end if;
+    end if;
+  end process;
+
+end architecture;
