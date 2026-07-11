@@ -1,0 +1,163 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity spi_aes_bridge is
+  port(
+    clk       : in  std_logic;
+    rst       : in  std_logic;
+
+    -- Byte interface from/to the SPI Slave
+    rx_byte   : in  std_logic_vector(7 downto 0);
+    rx_valid  : in  std_logic;
+    tx_byte   : out std_logic_vector(7 downto 0);
+    cs_active : in  std_logic;
+
+    -- Control and data interface to the AES Core
+    key_load  : out std_logic;
+    key_out   : out std_logic_vector(127 downto 0);
+    iv_load   : out std_logic;
+    iv_out    : out std_logic_vector(127 downto 0);
+    blk_valid : out std_logic;
+    data_out  : out std_logic_vector(127 downto 0);
+    data_in   : in  std_logic_vector(127 downto 0);
+    out_valid : in  std_logic;
+    busy      : in  std_logic;
+    key_ready : in  std_logic
+  );
+end entity;
+
+architecture rtl of spi_aes_bridge is
+  -- FSM states for decoding command byte and routing data streams
+  type state_t is (S_OPCODE, S_KEY, S_IV, S_PT, S_CT, S_STAT);
+  signal state    : state_t := S_OPCODE;
+
+  -- Counters and shift buffers for deserializing/serializing 128-bit blocks
+  signal byte_idx : unsigned(4 downto 0) := (others => '0');
+  signal shreg    : std_logic_vector(127 downto 0) := (others => '0');
+  signal ct_reg   : std_logic_vector(127 downto 0) := (others => '0');
+  signal ct_valid : std_logic := '0';
+
+  -- History registers for edge detection and output buffering
+  signal cs_prev  : std_logic := '0';
+  signal tx_r     : std_logic_vector(7 downto 0)   := (others => '0');
+
+  -- Holding registers for the outputs
+  signal key_r    : std_logic_vector(127 downto 0) := (others => '0');
+  signal iv_r     : std_logic_vector(127 downto 0) := (others => '0');
+  signal data_r   : std_logic_vector(127 downto 0) := (others => '0');
+begin
+  tx_byte  <= tx_r;
+  key_out  <= key_r;
+  iv_out   <= iv_r;
+  data_out <= data_r;
+
+  process(clk)
+    variable nxt : std_logic_vector(127 downto 0);
+  begin
+    if rising_edge(clk) then
+      -- Default: control signals are single-clock pulses
+      key_load  <= '0';
+      iv_load   <= '0';
+      blk_valid <= '0';
+
+      if rst = '1' then
+        state    <= S_OPCODE;
+        byte_idx <= (others => '0');
+        ct_valid <= '0';
+        ct_reg   <= (others => '0');
+        tx_r     <= (others => '0');
+        cs_prev  <= '0';
+      else
+        -- Instantly capture ciphertext from the AES core once encryption is done
+        if out_valid = '1' then
+          ct_reg   <= data_in;
+          ct_valid <= '1';
+        end if;
+
+        -- Detect rising edge (deactivation) of CS to reset the communication state
+        cs_prev <= cs_active;
+        if cs_prev = '1' and cs_active = '0' then
+          state    <= S_OPCODE;
+          byte_idx <= (others => '0');
+        end if;
+
+        -- Process incoming bytes only when marked valid by the SPI Slave
+        if rx_valid = '1' then
+          case state is
+            when S_OPCODE =>
+              byte_idx <= (others => '0');
+              case rx_byte is
+                when x"01" => state <= S_KEY;  -- Write Key command
+                when x"02" => state <= S_IV;   -- Write IV command
+                when x"03" => state <= S_PT;   -- Write Plaintext (and start encrypt)
+                when x"04" =>                  -- Read Ciphertext command
+                  state <= S_CT;
+                  -- Instantly preload the first byte of Ciphertext to TX
+                  tx_r  <= ct_reg(127 downto 120); 
+                when x"05" =>                  -- Read Status command
+                  state <= S_STAT;
+                  -- Formulate status byte: [5-bits zero, key_ready, busy, ct_valid]
+                  tx_r  <= "00000" & key_ready & busy & ct_valid;
+                when others =>
+                  state <= S_OPCODE;
+              end case;
+
+            when S_KEY =>
+              -- Shift in incoming byte (MSB first)
+              nxt := shreg(119 downto 0) & rx_byte;
+              shreg <= nxt;
+              if byte_idx = 15 then
+                key_load <= '1';
+                key_r    <= nxt;
+                state    <= S_OPCODE;
+              else
+                byte_idx <= byte_idx + 1;
+              end if;
+
+            when S_IV =>
+              -- Shift in incoming byte (MSB first)
+              nxt := shreg(119 downto 0) & rx_byte;
+              shreg <= nxt;
+              if byte_idx = 15 then
+                iv_load <= '1';
+                iv_r    <= nxt;
+                state   <= S_OPCODE;
+              else
+                byte_idx <= byte_idx + 1;
+              end if;
+
+            when S_PT =>
+              -- Shift in incoming plaintext byte (MSB first)
+              nxt := shreg(119 downto 0) & rx_byte;
+              shreg <= nxt;
+              if byte_idx = 15 then
+                blk_valid <= '1';
+                data_r    <= nxt;
+                ct_valid  <= '0'; -- Clear ciphertext valid flag as new encryption starts
+                state     <= S_OPCODE;
+              else
+                byte_idx <= byte_idx + 1;
+              end if;
+
+            when S_CT =>
+              -- Send out ciphertext byte-by-byte (MSB first)
+              if byte_idx = 15 then
+                state <= S_OPCODE;
+              else
+                tx_r <= ct_reg(127 - to_integer(byte_idx+1)*8
+                               downto 120 - to_integer(byte_idx+1)*8);
+                byte_idx <= byte_idx + 1;
+              end if;
+
+            when S_STAT =>
+              state <= S_OPCODE;
+
+            when others =>
+              state <= S_OPCODE;
+          end case;
+        end if;
+      end if;
+    end if;
+  end process;
+end architecture;
