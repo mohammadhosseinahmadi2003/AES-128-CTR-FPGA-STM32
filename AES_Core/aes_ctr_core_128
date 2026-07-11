@@ -1,0 +1,168 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.aes_pkg.all;
+
+entity aes_ctr_core_128 is
+  port(
+    clk        : in  std_logic;
+    rst        : in  std_logic;
+
+    key_load   : in  std_logic;
+    key_in     : in  std_logic_vector(127 downto 0);
+    iv_load    : in  std_logic;
+    iv_in      : in  std_logic_vector(127 downto 0);
+
+    blk_valid  : in  std_logic;
+    data_in    : in  std_logic_vector(127 downto 0);
+    data_out   : out std_logic_vector(127 downto 0);
+    out_valid  : out std_logic;
+
+    busy       : out std_logic;
+    key_ready  : out std_logic
+  );
+end entity;
+
+architecture rtl of aes_ctr_core_128 is
+
+  -- Top-level FSM for key expansion and CTR block processing
+  type st_t is (RESET_S, IDLE, KEXP, KDONE, ENC_START, ENC_WAIT, XOR_OUT);
+  signal state : st_t := RESET_S;
+
+  -- Register file holding all expanded round keys
+  signal rk_regs   : rk_array_t;
+  -- Counter register used as AES input in CTR mode
+  signal ctr_reg   : std_logic_vector(127 downto 0);
+  -- Register holding the current plaintext block
+  signal pt_reg    : std_logic_vector(127 downto 0);
+  -- Buffer holding the generated keystream block
+  signal ksbuf     : std_logic_vector(127 downto 0);
+
+  -- Key expansion control and data signals
+  signal ke_start  : std_logic := '0';
+  signal ke_done   : std_logic;
+  signal ke_key    : std_logic_vector(127 downto 0);
+  signal ke_rk     : rk_array_t;
+
+  -- AES encryption control and data signals
+  signal en_start  : std_logic := '0';
+  signal en_done   : std_logic;
+  signal en_din    : std_logic_vector(127 downto 0);
+  signal en_dout   : std_logic_vector(127 downto 0);
+
+  -- Internal flag indicating that round keys are ready
+  signal kready_r  : std_logic := '0';
+
+begin
+
+  -- Key expansion engine
+  u_ke : entity work.aes_key_expand_128
+    port map(
+      clk   => clk,
+      rst   => rst,
+      start => ke_start,
+      key   => ke_key,
+      rk    => ke_rk,
+      done  => ke_done
+    );
+
+  -- AES block encryption engine
+  u_enc : entity work.aes_encrypt_iter_128
+    port map(
+      clk   => clk,
+      rst   => rst,
+      start => en_start,
+      din   => en_din,
+      rk    => rk_regs,
+      dout  => en_dout,
+      done  => en_done
+    );
+
+  -- Core is busy in any state other than IDLE
+  busy      <= '0' when state = IDLE else '1';
+  -- Expose internal key-ready flag
+  key_ready <= kready_r;
+
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      if rst = '1' then
+        -- Reset control signals and internal registers
+        state     <= RESET_S;
+        ke_start  <= '0';
+        en_start  <= '0';
+        out_valid <= '0';
+        kready_r  <= '0';
+        ctr_reg   <= (others => '0');
+      else
+        -- Default pulse-style control outputs
+        ke_start  <= '0';
+        en_start  <= '0';
+        out_valid <= '0';
+
+        case state is
+
+          when RESET_S =>
+            -- Clear key-ready flag after reset
+            kready_r <= '0';
+            state    <= IDLE;
+
+          when IDLE =>
+            -- Load a new IV/counter value when requested
+            if iv_load = '1' then
+              ctr_reg <= iv_in;
+            end if;
+
+            -- Start key expansion when a new key is loaded
+            if key_load = '1' then
+              ke_key   <= key_in;
+              ke_start <= '1';
+              kready_r <= '0';
+              state    <= KEXP;
+
+            -- Start AES(counter) generation for a valid data block
+            elsif blk_valid = '1' and kready_r = '1' then
+              pt_reg   <= data_in;
+              en_din   <= ctr_reg;
+              en_start <= '1';
+              state    <= ENC_WAIT;
+            end if;
+
+          when KEXP =>
+            -- Wait until key expansion is complete
+            if ke_done = '1' then
+              rk_regs <= ke_rk;
+              state   <= KDONE;
+            end if;
+
+          when KDONE =>
+            -- Mark round keys as valid and ready for use
+            kready_r <= '1';
+            state    <= IDLE;
+
+          when ENC_START =>
+            -- Unused transitional state in the current implementation
+            state <= ENC_WAIT;
+
+          when ENC_WAIT =>
+            -- Wait for AES encryption of the counter block to complete
+            if en_done = '1' then
+              ksbuf <= en_dout;
+              state <= XOR_OUT;
+            end if;
+
+          when XOR_OUT =>
+            -- XOR plaintext with keystream to produce ciphertext/plaintext
+            data_out  <= pt_reg xor ksbuf;
+            out_valid <= '1';
+
+            -- Increment counter for the next CTR block
+            ctr_reg   <= std_logic_vector(unsigned(ctr_reg) + 1);
+            state     <= IDLE;
+
+        end case;
+      end if;
+    end if;
+  end process;
+
+end architecture;
