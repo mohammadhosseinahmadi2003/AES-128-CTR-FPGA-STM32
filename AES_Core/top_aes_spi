@@ -1,0 +1,125 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity top_aes_spi is
+  port (
+    clk       : in  std_logic;
+    rst       : in  std_logic;
+
+    -- Physical SPI pins
+    sck       : in  std_logic;
+    mosi      : in  std_logic;
+    miso      : out std_logic;
+    cs_n      : in  std_logic;
+
+    -- Debug LED output
+    led_ready : out std_logic
+  );
+end entity;
+
+architecture rtl of top_aes_spi is
+  
+  -- Internal reset signal.
+  -- External reset is active-low, while internal modules use active-high reset.
+  signal rst_i : std_logic;
+  
+  -- Free-running counter used to blink the debug LED
+  signal heartbeat_cnt : unsigned(23 downto 0) := (others => '0');
+  
+  -- Byte-level interface between SPI slave and bridge
+  signal rx_byte   : std_logic_vector(7 downto 0);
+  signal rx_valid  : std_logic;
+  signal tx_byte   : std_logic_vector(7 downto 0);
+  signal tx_load   : std_logic;
+  signal cs_active : std_logic;
+
+  -- AES command/data interface between bridge and AES core
+  signal key_out   : std_logic_vector(127 downto 0);
+  signal iv_out    : std_logic_vector(127 downto 0);
+  signal data_pt   : std_logic_vector(127 downto 0);
+  signal data_ct   : std_logic_vector(127 downto 0);
+  signal key_load  : std_logic;
+  signal iv_load   : std_logic;
+  signal blk_valid : std_logic;
+  signal out_valid : std_logic;
+  signal key_ready : std_logic;
+  signal busy      : std_logic;
+
+begin
+
+  -- Convert external active-low reset to internal active-high reset
+  rst_i <= not rst;
+  
+  -- Heartbeat counter for board/debug testing
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      heartbeat_cnt <= heartbeat_cnt + 1;
+    end if;
+  end process;
+
+  -- Blink LED to show that the FPGA clock and design are running
+  led_ready <= heartbeat_cnt(21);
+
+  -- Alternative debug option:
+  -- led_ready <= key_ready;
+
+  -- SPI slave interface.
+  -- Converts physical SPI signals into byte-level rx/tx signals.
+  u_spi : entity work.spi_slave_mode0
+    port map (
+      clk       => clk,
+      rst       => rst_i,
+      sck       => sck,
+      mosi      => mosi,
+      miso      => miso,
+      cs_n      => cs_n,
+      rx_byte   => rx_byte,
+      rx_valid  => rx_valid,
+      tx_byte   => tx_byte,
+      tx_load   => tx_load,
+      cs_active => cs_active
+    );
+
+  -- SPI-to-AES bridge.
+  -- Decodes opcodes, assembles 128-bit blocks, and manages AES control signals.
+  u_bridge : entity work.spi_aes_bridge
+    port map (
+      clk       => clk,
+      rst       => rst_i,
+      rx_byte   => rx_byte,
+      rx_valid  => rx_valid,
+      tx_byte   => tx_byte,
+      cs_active => cs_active,
+      key_load  => key_load,
+      key_out   => key_out,
+      iv_load   => iv_load,
+      iv_out    => iv_out,
+      blk_valid => blk_valid,
+      data_out  => data_pt,
+      data_in   => data_ct,
+      out_valid => out_valid,
+      busy      => busy,
+      key_ready => key_ready
+    );
+
+  -- AES-CTR core.
+  -- Expands the key, encrypts the counter, XORs with plaintext, and outputs ciphertext.
+  u_aes : entity work.aes_ctr_core_128
+    port map (
+      clk       => clk,
+      rst       => rst_i,
+      key_load  => key_load,
+      key_in    => key_out,
+      iv_load   => iv_load,
+      iv_in     => iv_out,
+      blk_valid => blk_valid,
+      data_in   => data_pt,
+      data_out  => data_ct,
+      out_valid => out_valid,
+      busy      => busy,
+      key_ready => key_ready
+    );
+
+end architecture;
