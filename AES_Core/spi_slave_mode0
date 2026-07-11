@@ -1,0 +1,114 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity spi_slave_mode0 is
+  port(
+    clk       : in  std_logic;
+    rst       : in  std_logic;                   
+
+    -- Physical SPI signals
+    sck       : in  std_logic;
+    mosi      : in  std_logic;
+    miso      : out std_logic;
+    cs_n      : in  std_logic;                  
+
+    -- Interface to Bridge
+    rx_byte   : out std_logic_vector(7 downto 0); -- Byte received from master
+    rx_valid  : out std_logic;                    -- Pulse when a full byte is received
+    tx_byte   : in  std_logic_vector(7 downto 0); -- Byte waiting to be sent to master
+    tx_load   : out std_logic;                    -- Request for new byte
+    cs_active : out std_logic                     -- Status indicating CS is pulled low
+  );
+end entity;
+
+architecture rtl of spi_slave_mode0 is
+
+  -- Synchronizers to handle clock domain crossing (CDC)
+  -- 3 stages for SCK to avoid metastability
+  signal sck_sync  : std_logic_vector(2 downto 0) := (others => '0');
+  signal mosi_sync : std_logic_vector(1 downto 0) := (others => '0');
+  signal cs_sync   : std_logic_vector(1 downto 0) := (others => '1');
+
+  signal sck_rise  : std_logic;
+  signal sck_fall  : std_logic;
+  signal cs_lvl    : std_logic; 
+
+  signal rx_shift  : std_logic_vector(7 downto 0) := (others => '0');
+  signal tx_shift  : std_logic_vector(7 downto 0) := (others => '0');
+  signal bit_cnt   : unsigned(2 downto 0) := (others => '0');
+  signal miso_r    : std_logic := '0';
+begin
+
+  -- Synchronize inputs to the internal FPGA clock domain
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      sck_sync  <= sck_sync(1 downto 0) & sck;
+      mosi_sync <= mosi_sync(0) & mosi;
+      cs_sync   <= cs_sync(0) & cs_n;
+    end if;
+  end process;
+
+  -- Edge detection based on synchronized signals
+  sck_rise <= '1' when (sck_sync(2 downto 1) = "01") else '0';
+  sck_fall <= '1' when (sck_sync(2 downto 1) = "10") else '0';
+  cs_lvl   <= cs_sync(1);
+
+  -- Internal signal to let Bridge know if SPI interface is active
+  cs_active <= '1' when cs_lvl = '0' else '0';
+  miso      <= miso_r;
+
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      -- Default pulse signals
+      rx_valid <= '0';
+      tx_load  <= '0';
+
+      if rst = '1' then
+        rx_shift <= (others => '0');
+        tx_shift <= (others => '0');
+        bit_cnt  <= (others => '0');
+        miso_r   <= '0';
+
+      elsif cs_lvl = '1' then
+        -- Chip Select is high (Inactive): Reset transmission state
+        bit_cnt <= (others => '0');
+        miso_r  <= tx_byte(7);   -- Preload MSB
+        tx_shift<= tx_byte;
+        tx_load <= '1';          -- Signal we are ready for data
+
+      else
+        -- Active communication
+        
+        -- RX Logic: Sample MOSI on rising edge of SCK
+        if sck_rise = '1' then
+          rx_shift <= rx_shift(6 downto 0) & mosi_sync(1);
+          if bit_cnt = "111" then
+            -- Full byte received
+            rx_byte  <= rx_shift(6 downto 0) & mosi_sync(1);
+            rx_valid <= '1';
+            bit_cnt  <= (others => '0');
+          else
+            bit_cnt <= bit_cnt + 1;
+          end if;
+        end if;
+
+        -- TX Logic: Update MISO on falling edge of SCK
+        if sck_fall = '1' then
+          if bit_cnt = "000" then
+            -- At start of a new byte, reload from Bridge
+            miso_r   <= tx_byte(7);
+            tx_shift <= tx_byte(6 downto 0) & '0';
+            tx_load  <= '1';
+          else
+            -- Shift existing byte
+            miso_r   <= tx_shift(7);
+            tx_shift <= tx_shift(6 downto 0) & '0';
+          end if;
+        end if;
+      end if;
+    end if;
+  end process;
+end architecture;
