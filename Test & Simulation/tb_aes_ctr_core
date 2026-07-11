@@ -1,0 +1,108 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity tb_aes_ctr_core_3 is
+end entity;
+
+architecture sim of tb_aes_ctr_core_3 is
+
+constant CLK_PERIOD : time := 10 ns;
+
+  signal clk       : std_logic := '0';
+  signal rst       : std_logic := '0';
+  signal key_load  : std_logic := '0';
+  signal iv_load   : std_logic := '0';
+  signal blk_valid : std_logic := '0';
+  signal out_valid : std_logic;
+  signal busy      : std_logic;
+  signal key_ready : std_logic;
+  signal key_in    : std_logic_vector(127 downto 0) := (others => '0');
+  signal iv_in     : std_logic_vector(127 downto 0) := (others => '0');
+  signal data_in   : std_logic_vector(127 downto 0) := (others => '0');
+  signal data_out  : std_logic_vector(127 downto 0);
+
+  signal cycle_count : integer := 0;
+
+begin
+
+  clk <= not clk after CLK_PERIOD / 2;
+
+  cnt : process(clk)
+  begin
+    if rising_edge(clk) then
+      cycle_count <= cycle_count + 1;
+    end if;
+  end process;
+
+  uut : entity work.aes_ctr_core_128
+    port map(
+      clk       => clk,
+      rst       => rst,
+      key_load  => key_load,
+      key_in    => key_in,
+      iv_load   => iv_load,
+      iv_in     => iv_in,
+      blk_valid => blk_valid,
+      data_in   => data_in,
+      data_out  => data_out,
+      out_valid => out_valid,
+      busy      => busy,
+      key_ready => key_ready
+    );
+
+  stim : process
+    variable cyc_start, cyc_end : integer;
+
+    -- NIST AES-128-CTR test vector
+    constant KEY  : std_logic_vector(127 downto 0) :=
+                    x"2b7e151628aed2a6abf7158809cf4f3c";
+    constant IV   : std_logic_vector(127 downto 0) :=
+                    x"f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff";
+    constant PT   : std_logic_vector(127 downto 0) :=
+                    x"6bc1bee22e409f96e93d7e117393172a";
+    -- expected: 874d6191b620e3261bef6864990db6ce
+  begin
+    
+    rst <= '1';
+    wait for CLK_PERIOD * 3;
+    rst <= '0';
+    wait until rising_edge(clk);
+
+  
+    key_in  <= KEY;
+    key_load <= '1';
+    wait until rising_edge(clk);
+    key_load <= '0';
+
+   
+    wait until key_ready = '1';
+    wait until rising_edge(clk);
+
+   
+    iv_in   <= IV;
+    iv_load <= '1';
+    wait until rising_edge(clk);
+    iv_load <= '0';
+    wait until rising_edge(clk);
+
+    
+    data_in   <= PT;
+    blk_valid <= '1';
+    wait until rising_edge(clk);
+    cyc_start := cycle_count;
+    blk_valid <= '0';
+
+    
+    wait until out_valid = '1';
+    wait until rising_edge(clk);
+    cyc_end := cycle_count;
+
+    report "Latency = " & integer'image(cyc_end - cyc_start) & " clock cycles";
+    report "data_out = " & integer'image(to_integer(unsigned(data_out(127 downto 96))))
+           & " (MSW, decimal)";
+
+    wait;
+  end process;
+
+end architecture;
