@@ -1,0 +1,98 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.aes_pkg.all;
+
+entity aes_encrypt_iter_128 is
+  port(
+    clk     : in  std_logic;
+    rst     : in  std_logic;
+    start   : in  std_logic;                     
+    din     : in  std_logic_vector(127 downto 0); -- Plaintext input
+    rk      : in  rk_array_t;                      -- Round keys (from key expander)
+    dout    : out std_logic_vector(127 downto 0); -- Ciphertext output
+    done    : out std_logic
+  );
+end entity;
+
+architecture rtl of aes_encrypt_iter_128 is
+  -- Finite State Machine to control the 10 rounds of encryption
+  type st_t is (IDLE, ADDR, WAITS, COMB);
+  signal state : st_t := IDLE;
+
+  -- Current round counter (1 to 10)
+  signal rcur   : integer range 1 to 10 := 1;
+  -- State register holding the intermediate ciphertext
+  signal sreg   : std_logic_vector(127 downto 0);
+  -- Input to the 16 parallel S-Boxes
+  signal sb_in  : std_logic_vector(127 downto 0);
+  -- Output from the 16 parallel S-Boxes
+  signal sb_out : std_logic_vector(127 downto 0);
+begin
+
+  -- Instantiate 16 parallel S-Boxes for byte-level substitution (SubBytes)
+  gen_sb : for i in 0 to 15 generate
+    u_sb : entity work.aes_sbox_bram
+      port map(
+        clk  => clk,
+        addr => sb_in (127-8*i downto 120-8*i),
+        dout => sb_out(127-8*i downto 120-8*i)
+      );
+  end generate;
+
+  dout <= sreg;
+
+  process(clk)
+    variable after_sr : std_logic_vector(127 downto 0);
+    variable after_mc : std_logic_vector(127 downto 0);
+  begin
+    if rising_edge(clk) then
+      if rst = '1' then
+        state <= IDLE;
+        done  <= '0';
+        rcur  <= 1;
+      else
+        done <= '0';
+        case state is
+
+          when IDLE =>
+            if start = '1' then
+              -- Pre-round: AddRoundKey with the initial key (rk[0])
+              sb_in <= din xor rk(0);
+              sreg  <= din xor rk(0);
+              rcur  <= 1;
+              state <= WAITS;
+            end if;
+
+          when ADDR =>
+            -- Feed the current state into the S-Boxes for the next round
+            sb_in <= sreg;
+            state <= WAITS;
+
+          when WAITS =>
+            -- Wait for BRAM synchronous output to become valid
+            state <= COMB; 
+
+          when COMB =>
+            -- Apply ShiftRows to the SubBytes output
+            after_sr := shift_rows(sb_out);
+
+            if rcur = 10 then
+              -- Final round (Round 10): No MixColumns step
+              sreg  <= after_sr xor rk(10);
+              done  <= '1';
+              state <= IDLE;
+            else
+              -- Standard round (1-9): Apply MixColumns and AddRoundKey
+              after_mc := mix_columns(after_sr);
+              sreg  <= after_mc xor rk(rcur);
+              rcur  <= rcur + 1;
+              state <= ADDR;
+            end if;
+
+        end case;
+      end if;
+    end if;
+  end process;
+
+end architecture;
