@@ -1,0 +1,34 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+-- Import the package containing the S-Box constant (AES_SBOX)
+use work.aes_pkg.all; 
+
+entity aes_sbox_bram is
+  port(
+    clk  : in  std_logic;
+    -- Input byte to be substituted
+    addr : in  std_logic_vector(7 downto 0); 
+    -- The output substituted byte
+    dout : out std_logic_vector(7 downto 0)  
+  );
+end entity;
+
+architecture rtl of aes_sbox_bram is
+  -- Initialize the ROM with the S-Box constants defined in the package
+  signal rom : sbox_array_t := AES_SBOX;
+
+  -- Attribute to force the synthesizer to map this array into Block RAM (BRAM)
+  -- This saves fabric resources (LUTs) and improves timing.
+  attribute rom_style : string;
+  attribute rom_style of rom : signal is "block";
+begin
+  -- Synchronous process: S-Box read occurs on the rising edge of the clock
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      -- Access the ROM array using the integer value of the input address
+      dout <= rom(to_integer(unsigned(addr)));
+    end if;
+  end process;
+end architecture;
